@@ -1,10 +1,15 @@
-livekit-agents
-livekit-plugins-openai
-livekit-plugins-silero
-livekit-plugins-google
-livekit-plugins-noise-cancellation
-mem0ai
-duckduckgo-search
-langchain_community
-requests
-python-dotenv
+# Core
+google-genai>=1.55          # Gemini provider
+python-dotenv>=1.0          # .env configuration
+requests>=2.32              # weather and web page fetching
+ddgs>=9.0                   # web search
+rich>=14.0                  # CLI rendering
+psutil>=7.0                 # system_status tool
+
+# Voice (optional: Cronus runs text-only without these)
+SpeechRecognition>=3.14     # microphone capture and speech-to-text
+PyAudio>=0.2.14             # microphone backend for SpeechRecognition
+pywin32>=306; sys_platform == "win32"   # Windows SAPI speech fallback
+
+# Development
+pytest>=8.0

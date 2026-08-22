@@ -1,16 +1,6 @@
-from cronus import Assistant
-from voice import listen, speak
+"""Entry point: python main.py [--voice|--speak] [-m "message"]"""
 
-agent = Assistant()
+from cronus.interfaces.cli import main
 
-while True:
-    user_text = listen()
-    if not user_text:
-        continue
-
-    print(f"🧑: {user_text}")
-
-    response = agent.run(user_text)
-
-    print(f"🤖: {response}")
-    speak(response)
+if __name__ == "__main__":
+    raise SystemExit(main())

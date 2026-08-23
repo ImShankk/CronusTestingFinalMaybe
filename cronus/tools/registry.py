@@ -30,6 +30,7 @@ class ToolRegistry:
 
     def __init__(self, default_timeout: float = 30.0, max_workers: int = 4) -> None:
         self._tools: dict[str, Tool] = {}
+        self._schemas: list[ToolSchema] | None = None
         self.default_timeout = default_timeout
         self._pool = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="cronus-tool"
@@ -48,6 +49,7 @@ class ToolRegistry:
         if tool.parameters.get("type") != "object":
             raise CronusError(f"tool {tool.name!r} must take an object parameter schema")
         self._tools[tool.name] = tool
+        self._schemas = None
         log.debug("registered tool %s (risk=%s)", tool.name, tool.risk.value)
         return tool
 
@@ -57,13 +59,14 @@ class ToolRegistry:
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
+        self._schemas = None
 
     # ------------------------------------------------------------------
     # Discovery
     # ------------------------------------------------------------------
     def get(self, name: str) -> Tool:
         tool = self._tools.get(name)
-        if tool is None or not tool.enabled:
+        if tool is None:
             known = ", ".join(sorted(self._tools)) or "none"
             raise ToolNotFound(
                 f"unknown tool {name!r} (known: {known})",
@@ -72,25 +75,19 @@ class ToolRegistry:
         return tool
 
     def has(self, name: str) -> bool:
-        tool = self._tools.get(name)
-        return tool is not None and tool.enabled
+        return name in self._tools
 
     def __iter__(self) -> Iterator[Tool]:
         return iter(sorted(self._tools.values(), key=lambda t: t.name))
 
     def __len__(self) -> int:
-        return sum(1 for tool in self._tools.values() if tool.enabled)
+        return len(self._tools)
 
     def schemas(self) -> list[ToolSchema]:
-        """Model-facing declarations for every enabled tool."""
-        return [tool.schema() for tool in self if tool.enabled]
-
-    def by_category(self) -> dict[str, list[Tool]]:
-        grouped: dict[str, list[Tool]] = {}
-        for tool in self:
-            if tool.enabled:
-                grouped.setdefault(tool.category, []).append(tool)
-        return grouped
+        """Model-facing declarations, rebuilt only when the tool set changes."""
+        if self._schemas is None:
+            self._schemas = [tool.schema() for tool in self]
+        return self._schemas
 
     # ------------------------------------------------------------------
     # Execution

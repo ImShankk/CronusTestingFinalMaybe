@@ -103,6 +103,3 @@ class PermissionPolicy:
         else:
             reason = f"{tool.name} is safe to run directly."
         return PermissionResult(decision, reason)
-
-    def describe(self, tool: Tool) -> str:
-        return self.check(tool).decision.value

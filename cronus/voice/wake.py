@@ -111,9 +111,12 @@ class PushToTalk(WakeWordDetector):
 def build_wake_word(
     stt: SpeechToText | None, config: VoiceConfig
 ) -> WakeWordDetector:
-    """Hands-free detection when enabled and possible, push-to-talk otherwise."""
-    if config.wake_word_enabled and stt is not None and stt.available:
+    """Hands-free detection when possible, press-Enter otherwise.
+
+    Whether wake-word detection is *wanted* is a question of voice mode; this
+    only answers whether it is *possible*.
+    """
+    if stt is not None and stt.available:
         return KeywordWakeWord(stt, config)
-    if config.wake_word_enabled:
-        log.warning("wake word requested but speech input is unavailable")
+    log.warning("wake word requested but speech input is unavailable")
     return PushToTalk()

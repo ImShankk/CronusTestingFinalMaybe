@@ -25,7 +25,7 @@ from ..security.permissions import Decision, PermissionPolicy
 from ..tools.base import ToolContext, ToolResult
 from ..tools.registry import ToolRegistry
 from .context import ContextBuilder
-from .conversation import Conversation
+from .conversation import Conversation, ConversationStore
 from .events import AssistantState, EventEmitter
 
 log = get_logger("core.runtime")
@@ -65,6 +65,7 @@ class Assistant:
         emitter: EventEmitter | None = None,
         confirmations: ConfirmationManager | None = None,
         voice_mode: bool = False,
+        conversation_store: ConversationStore | None = None,
     ) -> None:
         self.config = config
         self.provider = provider
@@ -79,17 +80,26 @@ class Assistant:
         )
         self.voice_mode = voice_mode
         self.conversation = Conversation()
+        # Optional: when present, the tail of the conversation outlives the
+        # process, so closing the terminal is not the same as being forgotten.
+        self.conversation_store = conversation_store
+        if conversation_store is not None:
+            conversation_store.restore(self.conversation)
         self.context = ContextBuilder(
             self.conversation,
             profile=profile,
             memory=memory,
             char_budget=config.context_char_budget,
             max_memories=config.memory.max_recall,
+            account_email=config.email.user,
+            timezone=config.timezone,
+            location=config.location,
         )
         self.tool_context = ToolContext(
             config=config,
             emitter=self.emitter,
             memory=memory,
+            profile=profile,
             scheduler=scheduler,
             paths=paths,
         )
@@ -107,6 +117,7 @@ class Assistant:
         self._cancelled = False
         log.info("user input received (%d chars)", len(user_text))
         self.conversation.begin_turn(user_text)
+        self.context.begin_turn()
 
         try:
             result = self._run_loop(user_text)
@@ -143,6 +154,13 @@ class Assistant:
 
     def reset_conversation(self) -> None:
         self.conversation.clear()
+        # "Start fresh" has to mean it, including after a restart.
+        if self.conversation_store is not None:
+            self.conversation_store.clear()
+
+    def _persist(self) -> None:
+        if self.conversation_store is not None:
+            self.conversation_store.save(self.conversation)
 
     # ------------------------------------------------------------------
     # Agent loop
@@ -151,6 +169,12 @@ class Assistant:
         tools_used: list[str] = []
         schemas = self.registry.schemas()
         started = time.time()
+
+        # Fold any turns that have dropped out of the window into the running
+        # summary now, so the cost lands while the user is already waiting
+        # rather than after their answer is ready.
+        self.emitter.set_state(AssistantState.THINKING)
+        self.context.maybe_summarise(self.provider)
 
         for iteration in range(1, self.config.max_tool_iterations + 1):
             if self._cancelled:
@@ -170,7 +194,7 @@ class Assistant:
                 if not text:
                     text = "I didn't get an answer together for that. Try rephrasing?"
                 self.conversation.end_turn(text)
-                self.context.maybe_summarise(self.provider)
+                self._persist()
                 self.emitter.response(text)
                 log.info(
                     "turn complete iterations=%d tools=%s elapsed=%.1fs",
@@ -256,9 +280,13 @@ class Assistant:
             self.emitter.set_state(AssistantState.EXECUTING)
             if not approved:
                 self.emitter.tool_end(tool.name, ok=False, summary="declined")
+                # "Did not approve" reads to a model as "has not confirmed
+                # yet", and it answers by offering again -- which is how a
+                # refusal turns into a loop. This says no, plainly.
                 return ToolResult.failure(
-                    f"The user did not approve {tool.name}, so it was not run. "
-                    "Acknowledge that briefly and ask what they'd like instead."
+                    "The user said no. This was not done, and must not be "
+                    "retried or offered again. Acknowledge it in one short "
+                    "sentence and stop there."
                 )
 
         self.emitter.tool_start(tool.name, arguments)
@@ -293,6 +321,7 @@ class Assistant:
         if not text:
             text = "I worked through several steps but couldn't finish that one."
         self.conversation.end_turn(text)
+        self._persist()
         self.emitter.response(text)
         return TurnResult(
             text=text,
@@ -313,7 +342,9 @@ def _trim(content: str) -> str:
 
 def _preview_details(tool_name: str, arguments: dict[str, Any]) -> dict[str, str]:
     """Show the fields a person needs to judge a pending action."""
-    interesting = ("to", "to_email", "recipient", "subject", "path", "destination", "url")
+    interesting = (
+        "to", "to_email", "recipient", "cc", "subject", "path", "destination", "url",
+    )
     details = {
         key: str(value)
         for key, value in arguments.items()

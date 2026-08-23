@@ -8,6 +8,7 @@ beyond that has to be added here as a real, bounded tool.
 from __future__ import annotations
 
 import platform
+import re
 import shutil
 import subprocess
 import webbrowser
@@ -18,6 +19,13 @@ from ..logging_setup import get_logger
 from .base import RiskLevel, Tool, ToolContext, ToolResult, object_schema
 
 log = get_logger("tools.system")
+
+# A real hostname: dot-separated labels, or "localhost". Checking merely for a
+# dot is not enough -- "https://../../secret" contains one.
+_HOSTNAME_RE = re.compile(
+    r"^(?:localhost|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})$",
+    re.IGNORECASE,
+)
 
 # Apps that are safe to launch by name on a desktop, resolved per platform.
 _BUILTIN_APPS = {
@@ -62,7 +70,9 @@ def open_url(url: str, context: ToolContext | None = None) -> ToolResult:
         )
     if not parsed.scheme:
         parsed = urlparse(f"https://{url.strip()}")
-    if not parsed.netloc or "." not in parsed.netloc:
+
+    host = (parsed.hostname or "").strip()
+    if not _HOSTNAME_RE.match(host):
         return ToolResult.failure(f"{url!r} is not a usable web address.")
 
     full_url = parsed.geturl()

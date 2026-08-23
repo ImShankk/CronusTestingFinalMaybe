@@ -243,12 +243,12 @@ def _size(num_bytes: float) -> str:
 
 
 def _delete_preview(arguments: dict[str, Any]) -> str:
-    return f"Permanently delete {arguments.get('path')}?"
+    # The path is shown on its own line below, so it is not repeated here.
+    return "Delete this file? This cannot be undone."
 
 
 def _write_preview(arguments: dict[str, Any]) -> str:
-    action = "Append to" if arguments.get("append") else "Overwrite"
-    return f"{action} {arguments.get('path')}?"
+    return "Add to this file?" if arguments.get("append") else "Overwrite this file?"
 
 
 def build_tools() -> list[Tool]:

@@ -18,7 +18,7 @@ from ..logging_setup import get_logger
 
 log = get_logger("storage.db")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -77,6 +77,16 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, next_run_at);
 
+-- The tail of the last conversation, so closing the terminal does not
+-- reset who Cronus is talking to. One row: the running summary plus the last
+-- few completed turns. Deliberately not a transcript archive.
+CREATE TABLE IF NOT EXISTS conversation_state (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    summary    TEXT NOT NULL DEFAULT '',
+    turns      TEXT NOT NULL DEFAULT '[]',
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -91,7 +101,11 @@ class Database:
         self.path = str(path)
         self._local = threading.local()
         self._shared: sqlite3.Connection | None = None
-        self._lock = threading.Lock()
+        # Re-entrant so a read inside a write block cannot deadlock.
+        self._lock = threading.RLock()
+        # Every connection handed out, so close() really closes all of them
+        # and not just the calling thread's.
+        self._connections: list[sqlite3.Connection] = []
 
         if self.path != ":memory:":
             try:
@@ -120,11 +134,14 @@ class Database:
             with self._lock:
                 if self._shared is None:
                     self._shared = self._connect()
+                    self._connections.append(self._shared)
                 return self._shared
         existing = getattr(self._local, "connection", None)
         if existing is None:
             existing = self._connect()
             self._local.connection = existing
+            with self._lock:
+                self._connections.append(existing)
         return existing
 
     def _init_schema(self) -> None:
@@ -156,18 +173,23 @@ class Database:
             raise StorageError(str(exc)) from exc
 
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        # Reads take the lock too: with an in-memory database every thread
+        # shares one connection, so an unsynchronised read can interleave with
+        # another thread's open transaction.
         try:
-            return list(self.connection.execute(sql, params).fetchall())
+            with self._lock:
+                return list(self.connection.execute(sql, params).fetchall())
         except sqlite3.Error as exc:
             log.error("database query failed: %s", exc)
             raise StorageError(str(exc)) from exc
 
     def close(self) -> None:
-        for connection in (getattr(self._local, "connection", None), self._shared):
-            if connection is not None:
+        with self._lock:
+            for connection in self._connections:
                 try:
                     connection.close()
                 except sqlite3.Error:  # pragma: no cover - shutdown best effort
                     pass
+            self._connections.clear()
         self._local = threading.local()
         self._shared = None

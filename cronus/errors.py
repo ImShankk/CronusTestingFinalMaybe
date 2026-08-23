@@ -46,10 +46,6 @@ class ToolValidationError(ToolError):
     default_user_message = "I called that tool incorrectly."
 
 
-class ToolTimeout(ToolError):
-    default_user_message = "That took too long, so I stopped it."
-
-
 class PermissionDenied(CronusError):
     """Application policy blocks this action. The model cannot override this."""
 
@@ -58,10 +54,6 @@ class PermissionDenied(CronusError):
 
 class PathNotAllowed(PermissionDenied):
     default_user_message = "That location is outside the folders I can touch."
-
-
-class ConfirmationDeclined(CronusError):
-    default_user_message = "Okay, I won't do that."
 
 
 class StorageError(CronusError):

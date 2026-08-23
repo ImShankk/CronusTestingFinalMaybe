@@ -1,6 +1,10 @@
 .env
 venv/
+.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
 *.wav
+*.db
+*.db-wal
+*.db-shm

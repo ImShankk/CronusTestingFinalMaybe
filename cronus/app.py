@@ -7,9 +7,10 @@ later) only have to ask for an :class:`Assistant` and subscribe to events.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
 
+from .automation.scheduler import Scheduler
 from .config import Config, load_config
+from .core.conversation import ConversationStore
 from .core.events import EventEmitter
 from .core.runtime import Assistant
 from .llm.base import LLMProvider
@@ -40,11 +41,19 @@ class Cronus:
     profile: UserProfile
     database: Database
     emitter: EventEmitter
-    scheduler: object | None = None
+    scheduler: Scheduler
+
+    def start(self) -> None:
+        """Begin firing reminders.
+
+        Deliberately separate from :func:`build`: an interface has to attach
+        its delivery handler first, or a task already due would fire into
+        nothing and be marked done.
+        """
+        self.scheduler.start()
 
     def shutdown(self) -> None:
-        if self.scheduler is not None:
-            self.scheduler.stop()
+        self.scheduler.stop()
         self.registry.shutdown()
         self.database.close()
         log.info("cronus stopped")
@@ -54,13 +63,13 @@ def build(
     config: Config | None = None,
     *,
     voice_mode: bool = False,
-    start_scheduler: bool = True,
     provider: LLMProvider | None = None,
-    on_task_due: Callable[[object], None] | None = None,
 ) -> Cronus:
-    """Construct the assistant and everything it depends on."""
-    from .automation.scheduler import Scheduler  # local import: avoids a cycle
+    """Construct the assistant and everything it depends on.
 
+    Nothing is started here. Call :meth:`Cronus.start` once the interface has
+    wired up its handlers.
+    """
     config = config or load_config()
     setup_logging(config.log_level, config.log_path)
     log.info("cronus starting model=%s voice=%s", config.llm.model, voice_mode)
@@ -69,7 +78,7 @@ def build(
     memory = MemoryStore(database, config.memory)
     profile = UserProfile(database, config)
     guard = PathGuard(config.security.file_roots, config.security.max_read_bytes)
-    scheduler = Scheduler(database, on_due=on_task_due)
+    scheduler = Scheduler(database, timezone=config.timezone)
 
     emitter = EventEmitter()
     registry = ToolRegistry(default_timeout=config.tool_timeout)
@@ -90,14 +99,8 @@ def build(
             timeout=config.security.confirmation_timeout
         ),
         voice_mode=voice_mode,
+        conversation_store=ConversationStore(database),
     )
-    # Tools that touch the profile reach it through the session, keeping the
-    # ToolContext free of every service in the application.
-    assistant.tool_context.session["profile"] = profile
-
-    if start_scheduler:
-        scheduler.start()
-
     return Cronus(
         config=config,
         assistant=assistant,

@@ -6,23 +6,24 @@ steps, remembers what matters, asks before doing anything consequential, and
 talks if you want it to.
 
 ```
-you  What's the weather in Edmonton tomorrow?
-     Using get_weather...
-cronus  Tomorrow in Edmonton: overcast, high of 26, low of 16.
+you  What's the weather tomorrow?
+     Checking the weather...
+cronus  Tomorrow in Edmonton: light showers, high of 22, low of 15.
 
-you  Remind me to bring an umbrella at 8.
-cronus  Done. I'll remind you tomorrow at 08:00.
+you  What about Saturday?
+cronus  Cooler and damp -- 16 and some light drizzle.
 
 you  Email john@example.com that I'll be 15 minutes late.
 
      ┌ Confirm ─────────────────────────────────────────┐
-     │ Send an email to john@example.com with the       │
-     │ subject 'Running late'?                          │
-     │ to: john@example.com                             │
-     │ body: Hi John, I'm running about 15 minutes      │
-     │ late. See you shortly.                           │
+     │ Send this email?                                 │
+     │ To: john@example.com                             │
+     │ Subject: Running late                            │
+     │                                                  │
+     │ Hi John, I'm running about 15 minutes late.      │
+     │ See you shortly.                                 │
      └──────────────────────────────────────────────────┘
-     Go ahead? [y/n]
+     Go ahead? [y/n] yes, go ahead
 ```
 
 ---
@@ -128,7 +129,7 @@ In-session commands:
 | `/profile` | show the stored user profile |
 | `/tasks` | list scheduled reminders |
 | `/voice` | toggle spoken replies |
-| `/clear` | start a fresh conversation |
+| `/clear` | forget the current conversation, here and on disk |
 | `/quit` | exit |
 
 ---
@@ -184,7 +185,8 @@ def build_tools() -> list[Tool]:
 
 Then add the module to `TOOL_MODULES` in `cronus/app.py`. A handler that
 declares a `context` parameter receives a `ToolContext` with configuration,
-memory, the scheduler, and the path guard.
+memory, the user profile, the scheduler, the path guard, and per-session
+scratch space.
 
 ---
 
@@ -212,6 +214,11 @@ instruction. It shows the actual arguments — the whole email body, the exact
 path — so you approve what will really happen. Declining reports back to the
 model, which acknowledges it rather than retrying.
 
+Consequential actions also guard against being done twice. An identical email
+already sent in this session is refused rather than delivered again, and asking
+twice for the same reminder updates the existing one instead of creating a
+second — a model that wrongly believes a step failed cannot repeat it.
+
 ### Filesystem safety
 
 File tools only work inside allowlisted roots (`CRONUS_FILE_ROOTS`, defaulting
@@ -227,6 +234,21 @@ instructions found in them rather than follow them. Cronus has **no shell and no
 arbitrary code execution** — `open_app` launches only allowlisted programs.
 
 ---
+
+## Location and time
+
+Cronus never guesses where you are. `CRONUS_LOCATION` is put into its context
+and used by the weather tool when you don't name a city, and `CRONUS_TIMEZONE`
+drives the clock, "tomorrow", and reminder times:
+
+```
+CRONUS_TIMEZONE=America/Edmonton
+CRONUS_LOCATION=Edmonton, Alberta, Canada
+```
+
+With neither set, Cronus is told its location is unknown and asks rather than
+picking a city. You can also just tell it — "I'm in Edmonton" — and it stores
+that in your profile, which takes precedence over the configured value.
 
 ## Memory
 
@@ -253,18 +275,96 @@ relevant memories, running summary, recent turns — inside a character budget
 one-off summary rather than replayed, so a long session does not inflate every
 request.
 
+Recall is widened by the last couple of turns, not just the sentence you typed.
+"What do you call me?" carries almost no searchable words of its own; the
+exchange it sits in does. A memory can only be helped into range by that, never
+pushed out of it.
+
+### Continuity
+
+Closing the terminal is not the same as being forgotten. The running summary
+and the last six turns are kept in `conversation_state` and restored on the
+next launch, so "what were we talking about?" still works tomorrow. Cronus is
+told how long ago that was, so it picks up rather than pretending no time
+passed.
+
+This is continuity, not an archive: only the tail is kept, `/clear` deletes it,
+and none of it becomes long-term memory — that is still written only when the
+model explicitly asks to store something.
+
 ---
 
 ## Voice
 
 ```bash
-python main.py --voice
+python main.py --voice          # or set CRONUS_VOICE=true
 ```
 
+### Modes
+
+`CRONUS_VOICE_MODE` chooses how a turn begins. All three share one runtime;
+they differ only in that first step.
+
+| Mode | How a turn starts |
+| --- | --- |
+| `continuous` (default) | Cronus listens again after every reply. No keypress. |
+| `push_to_talk` | Press Enter before each turn. Useful when debugging, or in a noisy room. |
+| `wake_word` | Stays idle until it hears "hey cronus". |
+
+The header tells you which is active:
+
+```
+gemini-flash-latest · 22 tools · voice: continuous · interruptible · /help
+Listening...
+```
+
+### Interruption (barge-in)
+
+Talking over Cronus stops it mid-sentence and starts listening. This is real
+cancellation, not a delayed reaction: speech plays on a worker thread while
+the microphone is watched, and the provider's own `stop()` cuts playback.
+
+What you said is then kept and answered. Interrupting is a request, not just a
+stop button, so the microphone reopens the instant speech stops and the
+utterance is carried into the next turn — you do not repeat yourself. The
+monitor only measures loudness, so the syllable or two that triggered the
+interrupt is genuinely lost; everything after it is not.
+
+The trigger adapts to the room. Rather than scaling a one-off calibration,
+Cronus measures the noise floor live during the first 0.4s of each reply --
+which already includes its own voice coming back through your speakers -- and
+requires you to be `CRONUS_BARGE_IN_SENSITIVITY` times louder than that, for
+at least `CRONUS_MIN_SPEECH_SECONDS`, tolerating the short dips between
+syllables. Set `CRONUS_BARGE_IN=false` to switch it off.
+
+Headphones make this far more reliable than speakers: with speakers the
+microphone hears Cronus, so the bar it sets for you is higher.
+
+### Not being cut off
+
+Endpointing is tuned for natural speech rather than dictation.
+`CRONUS_PAUSE_THRESHOLD` (default 1.0s) is how much silence ends a phrase --
+raise it if Cronus interrupts you when you pause to think.
+`CRONUS_PHRASE_TIME_LIMIT` (default 30s) is the longest single utterance.
+
 * **Speech-to-text** — `SpeechRecognition` with Google's free web endpoint.
-* **Speech-to-speech** — [Piper](https://github.com/rhasspy/piper/releases),
-  local and offline. Point `CRONUS_PIPER_EXE` and `CRONUS_PIPER_MODEL` at the
-  binary and a voice model. Without Piper, Windows SAPI is used automatically.
+* **Text-to-speech** — [Piper](https://github.com/rhasspy/piper/releases),
+  local and offline. `CRONUS_PIPER_EXE` is the executable itself;
+  `CRONUS_PIPER_MODEL` is a `.onnx` voice with its `.onnx.json` beside it
+  (Piper finds the JSON itself — never point at the `.json`). Voices come from
+  [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices); a
+  sensible layout is `<install>/piper/piper.exe` and `<install>/voices/`.
+  Without Piper, Windows SAPI is used and the header says so.
+
+  **Choosing a voice.** `high` voices sound better but synthesise roughly four
+  times slower, and Cronus starts `piper.exe` once per reply, so that cost is
+  paid every turn. On a mid-range CPU a `high` voice adds about a second to a
+  short reply and several seconds to a long one; `medium` is close to instant.
+  Try both — swapping is one line of `.env`.
+
+  **Speaking speed.** `CRONUS_SPEECH_RATE` maps to Piper's `--length-scale`
+  (higher rate, shorter audio). 1.25 is a good conversational pace; the effect
+  flattens out beyond roughly 2.0.
 * Replies are cleaned before speaking: no markdown, no URLs read out character
   by character.
 * Speech is interruptible — Ctrl+C cuts it off mid-sentence.
@@ -314,6 +414,9 @@ The essentials:
 | `GOOGLE_API_KEY` | — | **required** |
 | `CRONUS_MODEL` | `gemini-flash-latest` | which Gemini model |
 | `CRONUS_DATA_DIR` | `~/.cronus` | database and logs |
+| `CRONUS_TIMEZONE` | system | IANA name, e.g. `America/Edmonton` |
+| `CRONUS_LOCATION` | — | where you are, for weather and local questions |
+| `CRONUS_VOICE_MODE` | `continuous` | `continuous`, `push_to_talk`, or `wake_word` |
 | `CRONUS_FILE_ROOTS` | Documents, Desktop, Downloads | folders file tools may use |
 | `CRONUS_TOOL_PERMISSIONS` | — | per-tool permission overrides |
 | `CRONUS_MAX_TOOL_ITERATIONS` | `8` | tool round trips per request |
@@ -338,16 +441,24 @@ records as a backstop.
 python -m pytest
 ```
 
-225 tests, about three seconds, **no API key, no network, and no microphone
+419 tests, about nine seconds, **no API key, no network, and no microphone
 required** — the model is a scripted fake, external services are mocked, and
 voice providers are tested through their interfaces.
 
 Covered: the agent loop (chaining, parallel calls, tool failure recovery,
-iteration limits, cancellation), the tool registry (validation, timeouts, async
-handlers), permissions and confirmation, path containment and traversal,
-memory CRUD and persistence, context budgeting and summarisation, the scheduler,
-the Gemini translation layer, configuration errors, and realistic end-to-end
+iteration limits, cancellation, malformed and hostile model output), the tool
+registry (validation, timeouts, async handlers), permissions and confirmation,
+path containment and traversal, unsafe URL schemes, email header injection and
+duplicate sends, memory relevance and duplicate suppression, context budgeting
+and summarisation, the scheduler, concurrency across threads, the Gemini
+translation layer, configuration errors, and realistic end-to-end
 conversations.
+
+`tests/test_hardening.py` holds the regression tests from the post-build audit;
+each one pins a defect that was found and fixed. `tests/test_experience.py`
+pins the things a user actually perceives: that a follow-up resolves without
+repeating yourself, that talking over a reply keeps what you said, that a
+session survives a restart, and that tool names never reach the conversation.
 
 ---
 
@@ -365,6 +476,14 @@ conversations.
 * **A timed-out tool is abandoned, not killed.** Python cannot safely kill a
   thread, so handlers set their own network timeouts as well.
 * **No calendar integration.** Reminders are Cronus's own, not your calendar's.
+* **Barge-in depends on your audio setup.** Through speakers the microphone
+  also hears Cronus, so the interruption threshold rises and you may need to
+  speak up. Headphones avoid this entirely. There is no acoustic echo
+  cancellation.
+* **Continuous mode hears the room.** Background speech reaches the
+  recogniser and costs a transcription round trip, though it rarely produces a
+  usable request. Raise `CRONUS_MIC_ENERGY_THRESHOLD`, or use `push_to_talk`
+  or `wake_word`, where that matters.
 
 ## Roadmap
 

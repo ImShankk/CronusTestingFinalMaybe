@@ -9,10 +9,11 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol
 from ..llm.base import ToolSchema
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..automation.scheduler import Scheduler
     from ..config import Config
     from ..core.events import EventEmitter
     from ..memory.store import MemoryStore
-    from ..automation.scheduler import Scheduler
+    from ..profile import UserProfile
     from ..security.paths import PathGuard
 
 
@@ -24,19 +25,6 @@ class RiskLevel(enum.Enum):
     CONFIRM = "confirm"    # visible to the outside world or destructive
     HIGH = "high"          # dangerous; allowed only with explicit opt-in
     BLOCKED = "blocked"    # never executed
-
-    @property
-    def order(self) -> int:
-        return _RISK_ORDER[self]
-
-
-_RISK_ORDER = {
-    RiskLevel.SAFE: 0,
-    RiskLevel.LOW: 1,
-    RiskLevel.CONFIRM: 2,
-    RiskLevel.HIGH: 3,
-    RiskLevel.BLOCKED: 4,
-}
 
 
 @dataclass
@@ -51,8 +39,11 @@ class ToolContext:
     config: "Config"
     emitter: "EventEmitter | None" = None
     memory: "MemoryStore | None" = None
+    profile: "UserProfile | None" = None
     scheduler: "Scheduler | None" = None
     paths: "PathGuard | None" = None
+    # Scratch space that lives for the process: used to remember what has
+    # already been done this session, such as which emails have gone out.
     session: dict[str, Any] = field(default_factory=dict)
 
     def progress(self, message: str) -> None:
@@ -99,7 +90,6 @@ class Tool:
     category: str = "general"
     timeout: float | None = None
     preview: ConfirmationPreview | None = None
-    enabled: bool = True
 
     def schema(self) -> ToolSchema:
         """The model-facing view. Risk metadata deliberately stays internal."""

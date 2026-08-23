@@ -7,13 +7,40 @@ audio library, and tests never need a microphone.
 
 from __future__ import annotations
 
+import enum
+import threading
 from abc import ABC, abstractmethod
+
+
+class ListenOutcome(enum.Enum):
+    """Why a listen attempt produced no text.
+
+    An empty transcript on its own cannot tell a quiet room from a dead
+    microphone, so every attempt records which of these happened.
+    """
+
+    HEARD = "heard"                    # speech captured and transcribed
+    NO_SPEECH = "no_speech"            # silence or timeout -- entirely normal
+    NOT_UNDERSTOOD = "not_understood"  # audio captured but unintelligible
+    MIC_ERROR = "mic_error"            # the device could not be read
+    SERVICE_ERROR = "service_error"    # the recogniser could not be reached
+
+    @property
+    def is_failure(self) -> bool:
+        """True for conditions the user needs to act on."""
+        return self in (ListenOutcome.MIC_ERROR, ListenOutcome.SERVICE_ERROR)
 
 
 class SpeechToText(ABC):
     """Turns microphone audio into text."""
 
     name: str = "stt"
+
+    #: How the most recent :meth:`listen` ended. Callers read this to tell a
+    #: silent room from a broken microphone.
+    last_outcome: ListenOutcome = ListenOutcome.NO_SPEECH
+    #: Technical detail for the log only, never shown unless debugging.
+    last_error: str | None = None
 
     @property
     @abstractmethod
@@ -26,6 +53,22 @@ class SpeechToText(ABC):
 
     def calibrate(self) -> None:
         """Optionally adjust to background noise before the first capture."""
+
+    @property
+    def supports_barge_in(self) -> bool:
+        """Whether this provider can watch for speech while Cronus talks."""
+        return False
+
+    def wait_for_speech_start(
+        self, stop: "threading.Event", sensitivity: float = 2.5
+    ) -> bool:
+        """Block until someone starts speaking, or ``stop`` is set.
+
+        Returns True only if speech was heard. Providers that cannot monitor
+        the microphone return False immediately, and the caller simply does
+        not offer barge-in.
+        """
+        return False
 
 
 class TextToSpeech(ABC):

@@ -6,6 +6,7 @@ All configuration enters the process here. Secrets live in the environment
 
 from __future__ import annotations
 
+import enum
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,6 +68,16 @@ def _env_float(name: str, default: float) -> float:
         ) from exc
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    value = _env_int(name, default)
+    if value < 1:
+        raise ConfigError(
+            f"{name} must be at least 1, got {value}",
+            user_message=f"The setting {name} has to be 1 or more.",
+        )
+    return value
+
+
 def _env_opt_int(name: str) -> int | None:
     raw = _env(name)
     if raw is None:
@@ -96,9 +107,34 @@ class LLMConfig:
     request_timeout: float = 45.0
 
 
+class VoiceMode(enum.Enum):
+    """How Cronus decides the user is talking to it."""
+
+    PUSH_TO_TALK = "push_to_talk"   # press Enter before each turn
+    CONTINUOUS = "continuous"       # listen again after every reply
+    WAKE_WORD = "wake_word"         # stay idle until the wake phrase
+
+    @classmethod
+    def parse(cls, raw: str | None) -> "VoiceMode":
+        if not raw:
+            return cls.CONTINUOUS
+        key = raw.strip().lower().replace("-", "_").replace(" ", "_")
+        for mode in cls:
+            if mode.value == key:
+                return mode
+        raise ConfigError(
+            f"CRONUS_VOICE_MODE must be one of "
+            f"{', '.join(m.value for m in cls)}, got {raw!r}",
+            user_message=(
+                "CRONUS_VOICE_MODE should be push_to_talk, continuous, or wake_word."
+            ),
+        )
+
+
 @dataclass(frozen=True)
 class VoiceConfig:
     enabled: bool = False
+    mode: VoiceMode = VoiceMode.CONTINUOUS
     stt_provider: str = "google_web"
     tts_provider: str = "piper"
     piper_exe: str | None = None
@@ -106,7 +142,26 @@ class VoiceConfig:
     speech_rate: float = 1.0
     mic_index: int | None = None
     energy_threshold: int | None = None
-    phrase_time_limit: float = 15.0
+    # --- endpointing: when Cronus decides the user has finished speaking ---
+    #: Longest single utterance it will record.
+    phrase_time_limit: float = 30.0
+    #: How long to wait for the user to start speaking at all.
+    listen_timeout: float = 15.0
+    #: Silence needed to treat a phrase as finished. Raising this lets people
+    #: pause mid-sentence without being cut off.
+    pause_threshold: float = 1.0
+    #: Silence kept on each side of the captured phrase.
+    non_speaking_duration: float = 0.5
+    #: Ignore blips shorter than this; stops coughs becoming requests.
+    min_speech_seconds: float = 0.3
+
+    # --- barge-in ---
+    barge_in: bool = True
+    #: How much louder than the ambient threshold speech must be to interrupt.
+    #: Above 1.0 so Cronus's own voice through speakers is less likely to
+    #: interrupt itself.
+    barge_in_sensitivity: float = 2.5
+
     wake_word_enabled: bool = False
     wake_word: str = "hey cronus"
 
@@ -163,6 +218,7 @@ class Config:
     context_char_budget: int = 12_000
     user_name: str | None = None
     timezone: str | None = None
+    location: str | None = None
 
     @property
     def db_path(self) -> Path:
@@ -231,8 +287,30 @@ def load_config(
         request_timeout=_env_float("CRONUS_LLM_TIMEOUT", 45.0),
     )
 
+    wake_word_enabled = _env_bool("CRONUS_WAKE_WORD_ENABLED", False)
+    raw_mode = _env("CRONUS_VOICE_MODE")
+    if raw_mode is None and wake_word_enabled:
+        # Predates CRONUS_VOICE_MODE; honour it when no mode is stated.
+        voice_mode = VoiceMode.WAKE_WORD
+    else:
+        voice_mode = VoiceMode.parse(raw_mode)
+    pause_threshold = _env_float("CRONUS_PAUSE_THRESHOLD", 1.0)
+    non_speaking = _env_float("CRONUS_NON_SPEAKING_DURATION", 0.5)
+    if non_speaking > pause_threshold:
+        # SpeechRecognition requires this ordering; a silent clamp here beats
+        # an obscure failure inside the recogniser later.
+        raise ConfigError(
+            f"CRONUS_NON_SPEAKING_DURATION ({non_speaking}) cannot exceed "
+            f"CRONUS_PAUSE_THRESHOLD ({pause_threshold})",
+            user_message=(
+                "CRONUS_NON_SPEAKING_DURATION must be less than or equal to "
+                "CRONUS_PAUSE_THRESHOLD."
+            ),
+        )
+
     voice = VoiceConfig(
         enabled=_env_bool("CRONUS_VOICE", False),
+        mode=voice_mode,
         stt_provider=_env("CRONUS_STT_PROVIDER", "google_web"),
         tts_provider=_env("CRONUS_TTS_PROVIDER", "piper"),
         piper_exe=_env("CRONUS_PIPER_EXE"),
@@ -240,8 +318,14 @@ def load_config(
         speech_rate=_env_float("CRONUS_SPEECH_RATE", 1.0),
         mic_index=_env_opt_int("CRONUS_MIC_INDEX"),
         energy_threshold=_env_opt_int("CRONUS_MIC_ENERGY_THRESHOLD"),
-        phrase_time_limit=_env_float("CRONUS_PHRASE_TIME_LIMIT", 15.0),
-        wake_word_enabled=_env_bool("CRONUS_WAKE_WORD_ENABLED", False),
+        phrase_time_limit=_env_float("CRONUS_PHRASE_TIME_LIMIT", 30.0),
+        listen_timeout=_env_float("CRONUS_LISTEN_TIMEOUT", 15.0),
+        pause_threshold=pause_threshold,
+        non_speaking_duration=non_speaking,
+        min_speech_seconds=_env_float("CRONUS_MIN_SPEECH_SECONDS", 0.3),
+        barge_in=_env_bool("CRONUS_BARGE_IN", True),
+        barge_in_sensitivity=_env_float("CRONUS_BARGE_IN_SENSITIVITY", 2.5),
+        wake_word_enabled=wake_word_enabled or voice_mode is VoiceMode.WAKE_WORD,
         wake_word=(_env("CRONUS_WAKE_WORD", "hey cronus") or "hey cronus").lower(),
     )
 
@@ -264,7 +348,7 @@ def load_config(
     )
 
     memory = MemoryConfig(
-        max_recall=_env_int("CRONUS_MEMORY_RECALL", 6),
+        max_recall=_env_positive_int("CRONUS_MEMORY_RECALL", 6),
         min_relevance=_env_float("CRONUS_MEMORY_MIN_RELEVANCE", 0.15),
         max_stored=_env_int("CRONUS_MEMORY_MAX", 500),
     )
@@ -277,9 +361,10 @@ def load_config(
         memory=memory,
         data_dir=data_dir,
         log_level=(_env("CRONUS_LOG_LEVEL", "INFO") or "INFO").upper(),
-        max_tool_iterations=_env_int("CRONUS_MAX_TOOL_ITERATIONS", 8),
+        max_tool_iterations=_env_positive_int("CRONUS_MAX_TOOL_ITERATIONS", 8),
         tool_timeout=_env_float("CRONUS_TOOL_TIMEOUT", 30.0),
-        context_char_budget=_env_int("CRONUS_CONTEXT_BUDGET", 12_000),
+        context_char_budget=_env_positive_int("CRONUS_CONTEXT_BUDGET", 12_000),
         user_name=_env("CRONUS_USER_NAME"),
         timezone=_env("CRONUS_TIMEZONE"),
+        location=_env("CRONUS_LOCATION"),
     )

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from ..automation.scheduler import RecurrenceError, parse_recurrence
+from ..core import clock
 from ..errors import CronusError
 from ..logging_setup import get_logger
 from .base import RiskLevel, Tool, ToolContext, ToolResult, object_schema
@@ -52,9 +53,9 @@ def parse_when(raw: str, now: datetime | None = None) -> datetime:
         }[unit]
         return now + delta
 
-    clock = _CLOCK_RE.match(text)
-    if clock:
-        day, hour, minute, meridiem = clock.groups()
+    clock_match = _CLOCK_RE.match(text)
+    if clock_match:
+        day, hour, minute, meridiem = clock_match.groups()
         hour, minute = int(hour), int(minute or 0)
         if meridiem:
             meridiem = meridiem.lower()
@@ -87,13 +88,17 @@ def create_reminder(
     if context is None or context.scheduler is None:
         return ToolResult.failure("Scheduling isn't available right now.")
 
+    # "9am" means 9am where the user is.
+    timezone_name = context.config.timezone if context is not None else None
+    reference = clock.now(timezone_name).replace(tzinfo=None)
+
     moment = None
     if when:
         try:
-            moment = parse_when(when)
+            moment = parse_when(when, reference)
         except CronusError as exc:
             return ToolResult.failure(exc.user_message)
-        if moment < datetime.now() - timedelta(minutes=1):
+        if moment < reference - timedelta(minutes=1):
             return ToolResult.failure(
                 f"{moment:%Y-%m-%d %H:%M} is in the past. Ask the user which day they meant."
             )

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable
 
+from ..core import clock
 from ..errors import CronusError
 from ..logging_setup import get_logger
 from ..storage.db import Database
@@ -38,13 +39,15 @@ class Task:
     recurrence: str | None
     created_at: float
     run_count: int = 0
+    #: Timezone the times should be shown in; None means the system zone.
+    timezone: str | None = None
 
     @property
     def due_description(self) -> str:
         if self.next_run_at is None:
             return "no scheduled time"
-        when = datetime.fromtimestamp(self.next_run_at)
-        return when.strftime("%a %d %b at %H:%M")
+        moment = datetime.fromtimestamp(self.next_run_at).astimezone()
+        return clock.to_user_time(moment, self.timezone).strftime("%a %d %b at %H:%M")
 
     def summary(self) -> str:
         recurring = f", repeats {self.recurrence}" if self.recurrence else ""
@@ -113,10 +116,12 @@ class Scheduler:
         on_due: Callable[[Task], None] | None = None,
         *,
         tick: float = _TICK_SECONDS,
+        timezone: str | None = None,
     ) -> None:
         self.db = db
         self.on_due = on_due
         self.tick = tick
+        self.timezone = timezone
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -172,19 +177,27 @@ class Scheduler:
         if recurrence:
             recurrence = parse_recurrence(recurrence)
             if when is None:
-                when = next_occurrence(recurrence, datetime.now())
+                when = next_occurrence(
+                    recurrence, clock.now(self.timezone).replace(tzinfo=None)
+                )
         if when is None:
             raise CronusError(
                 "a task needs a time",
                 user_message="I need to know when to do that.",
             )
 
+        existing = self._find_duplicate(title, when, recurrence)
+        if existing is not None:
+            log.info("reminder already scheduled id=%s; not duplicating", existing.id)
+            return existing
+
         now = time.time()
+        due_at = clock.localise(when, self.timezone).timestamp()
         with self.db.write() as connection:
             cursor = connection.execute(
                 "INSERT INTO tasks(title, instruction, kind, status, next_run_at,"
                 " recurrence, created_at) VALUES (?, ?, ?, 'scheduled', ?, ?, ?)",
-                (title, instruction, kind, when.timestamp(), recurrence, now),
+                (title, instruction, kind, due_at, recurrence, now),
             )
             task_id = int(cursor.lastrowid)
         log.info("task scheduled id=%s at=%s recurrence=%s", task_id, when, recurrence)
@@ -194,10 +207,33 @@ class Scheduler:
             instruction=instruction,
             kind=kind,
             status="scheduled",
-            next_run_at=when.timestamp(),
+            next_run_at=due_at,
             recurrence=recurrence,
             created_at=now,
+            timezone=self.timezone,
         )
+
+    def _find_duplicate(
+        self, title: str, when: datetime, recurrence: str | None
+    ) -> Task | None:
+        """An identical reminder already on the books.
+
+        Asking twice for the same thing should not produce two notifications
+        every Friday for the rest of time.
+        """
+        wanted = title.strip().lower()
+        for task in self.upcoming(limit=100):
+            if task.title.strip().lower() != wanted:
+                continue
+            if task.recurrence != recurrence:
+                continue
+            if recurrence:
+                return task
+            if task.next_run_at is not None and abs(
+                task.next_run_at - clock.localise(when, self.timezone).timestamp()
+            ) < 60:
+                return task
+        return None
 
     def due_tasks(self, now: float | None = None) -> list[Task]:
         now = now if now is not None else time.time()
@@ -206,18 +242,24 @@ class Scheduler:
             " ORDER BY next_run_at",
             (now,),
         )
-        return [_to_task(row) for row in rows]
+        return [_to_task(row, self.timezone) for row in rows]
 
     def complete(self, task: Task) -> None:
         """Mark a task done, or roll a recurring one forward to its next slot."""
         now = time.time()
         if task.recurrence:
-            upcoming = next_occurrence(task.recurrence, datetime.fromtimestamp(now))
+            upcoming = next_occurrence(
+                task.recurrence, clock.now(self.timezone).replace(tzinfo=None)
+            )
             with self.db.write() as connection:
                 connection.execute(
                     "UPDATE tasks SET next_run_at = ?, last_run_at = ?,"
                     " run_count = run_count + 1 WHERE id = ?",
-                    (upcoming.timestamp(), now, task.id),
+                    (
+                        clock.localise(upcoming, self.timezone).timestamp(),
+                        now,
+                        task.id,
+                    ),
                 )
             log.info("recurring task id=%s rescheduled for %s", task.id, upcoming)
             return
@@ -244,14 +286,14 @@ class Scheduler:
             "SELECT * FROM tasks WHERE status = 'scheduled' ORDER BY next_run_at LIMIT ?",
             (limit,),
         )
-        return [_to_task(row) for row in rows]
+        return [_to_task(row, self.timezone) for row in rows]
 
     def get(self, task_id: int) -> Task | None:
         rows = self.db.query("SELECT * FROM tasks WHERE id = ?", (task_id,))
-        return _to_task(rows[0]) if rows else None
+        return _to_task(rows[0], self.timezone) if rows else None
 
 
-def _to_task(row) -> Task:
+def _to_task(row, timezone: str | None = None) -> Task:
     return Task(
         id=int(row["id"]),
         title=row["title"],
@@ -262,4 +304,5 @@ def _to_task(row) -> Task:
         recurrence=row["recurrence"],
         created_at=float(row["created_at"]),
         run_count=int(row["run_count"]),
+        timezone=timezone,
     )

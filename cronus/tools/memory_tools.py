@@ -90,12 +90,9 @@ def forget_memory(
 
 def set_preference(key: str, value: str, context: ToolContext | None = None) -> ToolResult:
     """Update a profile field the user has stated directly."""
-    if context is None:
+    if context is None or context.profile is None:
         return ToolResult.failure("Profile is not available right now.")
-    profile = context.session.get("profile")
-    if profile is None:
-        return ToolResult.failure("Profile is not available right now.")
-    if profile.set(key, value):
+    if context.profile.set(key, value):
         return ToolResult(content=f"Profile {key} set to {value!r}.", display="updated")
     from ..profile import KNOWN_KEYS
 

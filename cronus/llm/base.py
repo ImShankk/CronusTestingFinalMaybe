@@ -46,9 +46,6 @@ class Message:
     tool_call_id: str | None = None
     provider_state: dict[str, Any] = field(default_factory=dict)
 
-    def is_empty(self) -> bool:
-        return not self.content.strip() and not self.tool_calls
-
 
 @dataclass
 class LLMResponse:
@@ -94,6 +91,3 @@ class LLMProvider(ABC):
         Implementations must raise :class:`cronus.errors.ProviderError` for any
         backend failure rather than leaking SDK-specific exceptions.
         """
-
-    def close(self) -> None:  # pragma: no cover - optional hook
-        """Release any long-lived resources."""

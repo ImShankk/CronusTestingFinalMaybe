@@ -23,6 +23,7 @@ KNOWN_KEYS = {
     "timezone": "the user's timezone",
     "response_style": "preferred answer length and tone",
     "default_city": "city assumed for weather and local questions",
+    "location": "where the user is, for weather and local questions",
     "email_signature": "how to sign emails sent on their behalf",
 }
 
@@ -37,6 +38,8 @@ class UserProfile:
                 self.set("name", config.user_name, overwrite=False)
             if config.timezone:
                 self.set("timezone", config.timezone, overwrite=False)
+            if config.location:
+                self.set("location", config.location, overwrite=False)
 
     def get(self, key: str, default: str | None = None) -> str | None:
         rows = self.db.query("SELECT value FROM profile WHERE key = ?", (key,))

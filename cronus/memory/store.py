@@ -35,6 +35,12 @@ _STOPWORDS = frozenset(
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
 _MIN_CONTENT = 3
 _MAX_CONTENT = 500
+# How much wording two memories must share to count as the same one.
+# Preferences use a lower bar: the model restates the same standing
+# instruction in different words ("concise answers", "short answers"), and
+# letting those accumulate both bloats the store and eats recall slots.
+_DUPLICATE_OVERLAP = 0.7
+_PREFERENCE_DUPLICATE_OVERLAP = 0.45
 
 
 @dataclass
@@ -54,10 +60,15 @@ class MemoryItem:
 
 
 def _tokens(text: str) -> set[str]:
+    """Significant words, plus every number.
+
+    Numbers are kept whatever their length: dropping them would let "take the
+    pill at 8" and "take the pill at 9" look like the same memory.
+    """
     return {
         token
         for token in _TOKEN_RE.findall(text.lower())
-        if len(token) > 2 and token not in _STOPWORDS
+        if (len(token) > 2 or token.isdigit()) and token not in _STOPWORDS
     }
 
 
@@ -154,11 +165,6 @@ class MemoryStore:
             self.forget(item.id)
         return len(matches)
 
-    def clear(self) -> int:
-        with self.db.write() as connection:
-            cursor = connection.execute("DELETE FROM memories")
-            return cursor.rowcount
-
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------
@@ -178,19 +184,33 @@ class MemoryStore:
         return int(rows[0]["n"]) if rows else 0
 
     def recall(
-        self, query: str, *, limit: int | None = None, min_score: float | None = None
+        self,
+        query: str,
+        *,
+        limit: int | None = None,
+        min_score: float | None = None,
+        context: str = "",
     ) -> list[MemoryItem]:
         """Return memories relevant to ``query``, most relevant first.
 
         Preferences are always considered -- they are what the user expects to
         apply even when they don't restate them.
+
+        ``context`` is recent conversation, used to widen the search only.
+        "What do you call me?" carries almost no searchable words of its own,
+        but the exchange it sits in does. Each memory is scored against the
+        message alone and against the message plus its context, and keeps the
+        better of the two -- so context can surface a memory that would
+        otherwise be missed, and can never push one below where it already
+        scored.
         """
         limit = limit or self.config.max_recall
         threshold = self.config.min_relevance if min_score is None else min_score
         query_tokens = _tokens(query)
+        widened = _tokens(f"{query} {context}") if context else query_tokens
 
         candidates: dict[int, MemoryItem] = {}
-        for item in self._fts_candidates(query_tokens):
+        for item in self._fts_candidates(widened):
             candidates[item.id] = item
         for item in self._preferences():
             candidates.setdefault(item.id, item)
@@ -198,14 +218,48 @@ class MemoryStore:
         scored: list[tuple[float, MemoryItem]] = []
         for item in candidates.values():
             score = self._score(item, query_tokens)
+            if widened is not query_tokens:
+                score = max(score, self._score(item, widened))
             if score >= threshold:
                 scored.append((score, item))
 
         scored.sort(key=lambda pair: pair[0], reverse=True)
-        chosen = [item for _, item in scored[:limit]]
+        chosen = self._select(scored, limit)
         if chosen:
             self._mark_used([item.id for item in chosen])
             log.debug("recalled %d memories for query", len(chosen))
+        return chosen
+
+    @staticmethod
+    def _select(
+        scored: list[tuple[float, MemoryItem]], limit: int
+    ) -> list[MemoryItem]:
+        """Pick the final set, capping how many slots preferences may take.
+
+        Preferences always apply, so they score highly by construction. Left
+        unchecked a handful of them fills every slot and the thing the user
+        actually asked about never reaches the model.
+        """
+        preference_budget = max(1, limit // 3)
+        chosen: list[MemoryItem] = []
+        leftover: list[MemoryItem] = []
+        preferences_taken = 0
+
+        for _, item in scored:
+            if len(chosen) >= limit:
+                break
+            if item.kind == "preference":
+                if preferences_taken >= preference_budget:
+                    leftover.append(item)
+                    continue
+                preferences_taken += 1
+            chosen.append(item)
+
+        # Spare slots go back to the preferences that were held back.
+        for item in leftover:
+            if len(chosen) >= limit:
+                break
+            chosen.append(item)
         return chosen
 
     # ------------------------------------------------------------------
@@ -251,6 +305,11 @@ class MemoryStore:
         tokens = _tokens(content)
         if not tokens:
             return None
+        threshold = (
+            _PREFERENCE_DUPLICATE_OVERLAP
+            if kind == "preference"
+            else _DUPLICATE_OVERLAP
+        )
         for item in self.db.query(
             "SELECT * FROM memories WHERE kind = ? ORDER BY updated_at DESC LIMIT 50",
             (kind,),
@@ -260,7 +319,7 @@ class MemoryStore:
             if not other:
                 continue
             overlap = len(tokens & other) / len(tokens | other)
-            if overlap >= 0.7:
+            if overlap >= threshold:
                 return candidate
         return None
 

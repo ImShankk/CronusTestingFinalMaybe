@@ -8,6 +8,7 @@ mid-sentence when the user interrupts.
 
 from __future__ import annotations
 
+import itertools
 import re
 import subprocess
 import sys
@@ -22,6 +23,11 @@ from .base import TextToSpeech
 log = get_logger("voice.tts")
 
 _SPEAK_TIMEOUT = 60
+# A reminder can come due on the scheduler thread while a reply is being
+# spoken on the main thread. Speech is a single shared output device, so only
+# one utterance may hold it at a time.
+_speech_lock = threading.Lock()
+_utterance_ids = itertools.count()
 
 
 def clean_for_speech(text: str) -> str:
@@ -44,6 +50,8 @@ class PiperTTS(TextToSpeech):
     def __init__(self, config: VoiceConfig) -> None:
         self.config = config
         self._stop = threading.Event()
+        #: The synthesis process currently running, so it can be cut short.
+        self._process: subprocess.Popen | None = None
         self._temp_dir = Path(tempfile.gettempdir()) / "cronus-voice"
         self._temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -55,8 +63,14 @@ class PiperTTS(TextToSpeech):
         spoken = clean_for_speech(text)
         if not spoken:
             return
+        with _speech_lock:
+            self._speak_locked(spoken)
+
+    def _speak_locked(self, spoken: str) -> None:
         self._stop.clear()
-        wav_path = self._temp_dir / "speech.wav"
+        # A distinct file per utterance: two speakers must never write the
+        # same wav while the other is reading it.
+        wav_path = self._temp_dir / f"speech-{next(_utterance_ids)}.wav"
 
         # Piper slows down as length-scale rises, so invert the rate.
         length_scale = max(0.5, min(1.0 / max(self.config.speech_rate, 0.1), 2.0))
@@ -69,77 +83,139 @@ class PiperTTS(TextToSpeech):
             "--length-scale",
             f"{length_scale:.2f}",
         ]
+        # Popen rather than run(): a higher-quality voice can take seconds to
+        # synthesise, and barge-in has to be able to abandon that work rather
+        # than make the user wait for a reply they already interrupted.
         try:
-            process = subprocess.run(
+            process = subprocess.Popen(
                 command,
-                input=spoken,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                capture_output=True,
-                timeout=_SPEAK_TIMEOUT,
             )
+        except OSError as exc:
+            log.error("could not start piper: %s", exc)
+            return
+
+        self._process = process
+        try:
+            process.communicate(input=spoken, timeout=_SPEAK_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            log.error("piper synthesis timed out after %ss", _SPEAK_TIMEOUT)
+            process.kill()
+            process.communicate()
+            wav_path.unlink(missing_ok=True)
+            return
         except (OSError, subprocess.SubprocessError) as exc:
             log.error("piper synthesis failed: %s", exc)
+            wav_path.unlink(missing_ok=True)
+            return
+        finally:
+            self._process = None
+
+        if self._stop.is_set():
+            # Interrupted while still synthesising: throw the audio away.
+            log.debug("synthesis abandoned after interruption")
+            wav_path.unlink(missing_ok=True)
             return
         if process.returncode != 0 or not wav_path.exists():
             log.error("piper exited with %s", process.returncode)
+            wav_path.unlink(missing_ok=True)
             return
-        _play_wav(wav_path, self._stop)
+        try:
+            _play_wav(wav_path, self._stop)
+        finally:
+            wav_path.unlink(missing_ok=True)
 
     def stop(self) -> None:
         self._stop.set()
+        # Kill synthesis in flight as well as audio already playing, so an
+        # interruption is prompt whichever stage the reply had reached.
+        process = self._process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:  # pragma: no cover - already gone
+                log.debug("piper process already exited")
         _stop_playback()
 
 
+# SAPI flags.
+_SVSF_ASYNC = 1
+_SVSF_PURGE = 3          # async + purge before speak
+_POLL_MS = 50            # how often to check for an interruption
+
+
 class SapiTTS(TextToSpeech):
-    """The built-in Windows voice. No extra downloads, always available here."""
+    """The built-in Windows voice. No extra downloads, always available here.
+
+    SAPI is COM, and COM is per-thread: a voice created on one thread cannot
+    be driven from another, and any thread using it must initialise COM
+    first. Speech runs on a worker thread so it can be interrupted, so the
+    voice is thread-local and :meth:`stop` only raises a flag -- the purge
+    itself happens on whichever thread is actually speaking.
+    """
 
     name = "sapi"
 
     def __init__(self, config: VoiceConfig) -> None:
         self.config = config
-        self._voice = None
+        self._local = threading.local()
         self._stop = threading.Event()
 
     @property
     def available(self) -> bool:
         if sys.platform != "win32":
             return False
-        try:
-            import win32com.client
-        except ImportError:
-            return False
-        return win32com.client is not None
+        import importlib.util
+
+        return importlib.util.find_spec("win32com.client") is not None
 
     def _ensure_voice(self):
-        if self._voice is None:
-            import win32com.client
+        """A SAPI voice belonging to the calling thread."""
+        voice = getattr(self._local, "voice", None)
+        if voice is not None:
+            return voice
 
-            self._voice = win32com.client.Dispatch("SAPI.SpVoice")
-            # SAPI rate runs -10..10; map 1.0x to 0 and scale from there.
-            self._voice.Rate = int(max(-10, min((self.config.speech_rate - 1) * 10, 10)))
-        return self._voice
+        import pythoncom
+        import win32com.client
+
+        try:
+            pythoncom.CoInitialize()
+        except Exception:  # pragma: no cover - already initialised is fine
+            log.debug("COM already initialised on this thread")
+
+        voice = win32com.client.Dispatch("SAPI.SpVoice")
+        # SAPI rate runs -10..10; map 1.0x to 0 and scale from there.
+        voice.Rate = int(max(-10, min((self.config.speech_rate - 1) * 10, 10)))
+        self._local.voice = voice
+        return voice
 
     def speak(self, text: str) -> None:
         spoken = clean_for_speech(text)
         if not spoken:
             return
-        try:
-            voice = self._ensure_voice()
-            self._stop.clear()
-            # 1 == SVSFlagsAsync, so stop() can interrupt mid-sentence.
-            voice.Speak(spoken, 1)
-            while voice.Status.RunningState == 2 and not self._stop.is_set():
-                threading.Event().wait(0.05)
-        except Exception as exc:
-            log.error("sapi speech failed: %s", exc)
+        with _speech_lock:
+            try:
+                voice = self._ensure_voice()
+                self._stop.clear()
+                voice.Speak(spoken, _SVSF_ASYNC)
+                # WaitUntilDone returns False while still speaking. Polling
+                # Status.RunningState instead races the start of playback and
+                # returns immediately, leaving audio running unattended.
+                while not voice.WaitUntilDone(_POLL_MS):
+                    if self._stop.is_set():
+                        # Purge here: this is the thread that owns the voice.
+                        voice.Speak("", _SVSF_PURGE)
+                        break
+            except Exception as exc:
+                log.error("sapi speech failed: %s", exc)
 
     def stop(self) -> None:
+        # Only a flag: the speaking thread does the actual purge, because the
+        # COM object cannot be touched from here.
         self._stop.set()
-        if self._voice is not None:
-            try:
-                self._voice.Speak("", 3)  # purge whatever is queued
-            except Exception:  # pragma: no cover - shutdown best effort
-                pass
 
 
 def _can_play_audio() -> bool:

@@ -155,7 +155,6 @@ def make_assistant(config: Config, registry: ToolRegistry, memory: MemoryStore,
             confirmations=confirmations,
             **kwargs,
         )
-        assistant.tool_context.session["profile"] = profile
         return assistant
 
     return _build
@@ -168,6 +167,13 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch):
         "GOOGLE_API_KEY", "GEMINI_API_KEY", "GMAIL_USER", "GMAIL_APP_PASSWORD",
         "CRONUS_MODEL", "CRONUS_DATA_DIR", "CRONUS_FILE_ROOTS", "CRONUS_VOICE",
         "CRONUS_TOOL_PERMISSIONS", "CRONUS_LOG_LEVEL", "CRONUS_TEMPERATURE",
+        "CRONUS_TIMEZONE", "CRONUS_LOCATION", "CRONUS_VOICE_MODE",
+        "CRONUS_PHRASE_TIME_LIMIT", "CRONUS_LISTEN_TIMEOUT",
+        "CRONUS_PAUSE_THRESHOLD", "CRONUS_NON_SPEAKING_DURATION",
+        "CRONUS_MIN_SPEECH_SECONDS", "CRONUS_BARGE_IN",
+        "CRONUS_BARGE_IN_SENSITIVITY", "CRONUS_WAKE_WORD_ENABLED",
+        "CRONUS_MAX_TOOL_ITERATIONS", "CRONUS_CONTEXT_BUDGET",
+        "CRONUS_MEMORY_RECALL", "CRONUS_PIPER_EXE", "CRONUS_PIPER_MODEL",
     ):
         monkeypatch.delenv(name, raising=False)
     yield

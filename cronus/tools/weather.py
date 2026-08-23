@@ -11,7 +11,7 @@ from typing import Any
 import requests
 
 from ..logging_setup import get_logger
-from .base import RiskLevel, Tool, ToolResult, object_schema
+from .base import RiskLevel, Tool, ToolContext, ToolResult, object_schema
 
 log = get_logger("tools.weather")
 
@@ -49,8 +49,34 @@ def _geocode(city: str) -> dict[str, Any] | None:
     return results[0] if results else None
 
 
-def get_weather(city: str, days: int = 1) -> ToolResult:
+def resolve_location(city: str | None, context: ToolContext | None) -> str | None:
+    """Where to look, preferring what the user actually said.
+
+    Order: the city in the request, then anything the user has told Cronus,
+    then the configured location. Returns None when nothing is known, so the
+    caller can ask instead of picking somewhere at random.
+    """
+    if city and city.strip():
+        return city.strip()
+    if context is None:
+        return None
+    if context.profile is not None:
+        stated = context.profile.get("location") or context.profile.get("default_city")
+        if stated:
+            return stated
+    return context.config.location
+
+
+def get_weather(
+    city: str | None = None, days: int = 1, context: ToolContext | None = None
+) -> ToolResult:
     """Current conditions, plus a short forecast when asked for."""
+    city = resolve_location(city, context)
+    if not city:
+        return ToolResult.failure(
+            "No location is configured and none was given, so there is nowhere "
+            "to check. Ask the user which place they mean -- do not guess a city."
+        )
     try:
         place = _geocode(city)
     except requests.RequestException as exc:
@@ -134,13 +160,21 @@ def build_tools() -> list[Tool]:
             name="get_weather",
             description=(
                 "Current weather and short forecast for a city. Use this for any "
-                "question about temperature, rain, snow, or conditions."
+                "question about temperature, rain, snow, or conditions right now "
+                "or in the next seven days. It cannot say what a place is "
+                "typically like in a season or a month -- for that, answer from "
+                "what you know and say you are describing the usual climate "
+                "rather than a forecast."
             ),
             parameters=object_schema(
                 {
                     "city": {
                         "type": "string",
-                        "description": "City name, optionally with region or country.",
+                        "description": (
+                            "City name, optionally with region or country. Leave "
+                            "this out to use the user's own location. Never "
+                            "invent a city."
+                        ),
                     },
                     "days": {
                         "type": "integer",
@@ -150,7 +184,6 @@ def build_tools() -> list[Tool]:
                         "default": 1,
                     },
                 },
-                required=["city"],
             ),
             handler=get_weather,
             risk=RiskLevel.SAFE,

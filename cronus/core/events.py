@@ -22,7 +22,6 @@ class EventType(enum.Enum):
     PROGRESS = "progress"        # short human-readable status line
     TOOL_START = "tool_start"
     TOOL_END = "tool_end"
-    CONFIRMATION = "confirmation"
     ERROR = "error"
     RESPONSE = "response"        # final assistant text for this turn
 
@@ -34,6 +33,7 @@ class AssistantState(enum.Enum):
     EXECUTING = "executing"
     WAITING_FOR_CONFIRMATION = "waiting_for_confirmation"
     SPEAKING = "speaking"
+    INTERRUPTED = "interrupted"
     ERROR = "error"
 
 

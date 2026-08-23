@@ -39,9 +39,8 @@ class ConfirmationRequest:
     expires_at: float | None = None
     status: ConfirmationStatus = ConfirmationStatus.PENDING
 
-    @property
-    def expired(self) -> bool:
-        return self.expires_at is not None and time.time() > self.expires_at
+    def is_expired(self, now: float) -> bool:
+        return self.expires_at is not None and now > self.expires_at
 
     def render(self) -> str:
         lines = [self.summary]
@@ -105,7 +104,7 @@ class ConfirmationManager:
 
     def resolve(self, request: ConfirmationRequest) -> bool:
         """Ask the handler and record the outcome. Returns True if approved."""
-        if request.expired:
+        if request.is_expired(self._clock()):
             request.status = ConfirmationStatus.EXPIRED
             self.pending = None
             log.info("confirmation expired id=%s", request.id)

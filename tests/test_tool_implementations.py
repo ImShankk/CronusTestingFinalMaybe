@@ -13,13 +13,12 @@ from cronus.tools.base import ToolContext
 
 @pytest.fixture
 def context(config, workspace, memory, profile) -> ToolContext:
-    ctx = ToolContext(
+    return ToolContext(
         config=config,
         memory=memory,
+        profile=profile,
         paths=PathGuard(config.security.file_roots, config.security.max_read_bytes),
     )
-    ctx.session["profile"] = profile
-    return ctx
 
 
 # ----------------------------------------------------------------------
@@ -327,12 +326,13 @@ def test_attachments_are_contained(context: ToolContext, tmp_path: Path):
     assert not result.ok and "only work inside" in result.content
 
 
-def test_drafting_does_not_send(monkeypatch, context: ToolContext):
+def test_drafting_does_not_send(monkeypatch):
     FakeSMTP.instances.clear()
     monkeypatch.setattr(email_tool.smtplib, "SMTP", FakeSMTP)
-    result = email_tool.draft_email("a@b.com", "Subject", "Body", context=context)
+    result = email_tool.draft_email("a@b.com", "Subject", "Body")
     assert result.ok and FakeSMTP.instances == []
-    assert context.session["email_draft"]["to"] == "a@b.com"
+    # The draft reaches the model as the tool result, not as hidden state.
+    assert "a@b.com" in result.content and "Body" in result.content
 
 
 # ----------------------------------------------------------------------
@@ -354,7 +354,7 @@ def test_forgetting_by_id(context: ToolContext):
 
 def test_setting_a_known_preference(context: ToolContext):
     assert memory_tools.set_preference("name", "Sam", context=context).ok
-    assert context.session["profile"].get("name") == "Sam"
+    assert context.profile.get("name") == "Sam"
 
 
 def test_unknown_profile_fields_are_refused(context: ToolContext):

@@ -146,7 +146,10 @@ def test_declined_confirmation_stops_the_tool(make_assistant):
     )
     result = assistant.send("do the risky thing")
     tool_message = [m for m in assistant.provider.calls[1]["messages"] if m.role == "tool"][0]
-    assert "did not approve" in tool_message.content
+    # The model must read this as a refusal, not as "not confirmed yet" --
+    # the latter makes it offer the same action again.
+    assert "said no" in tool_message.content
+    assert "must not be" in tool_message.content
     assert "did it to" not in tool_message.content
     assert result.text == "Left it alone."
 

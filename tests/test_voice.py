@@ -132,13 +132,14 @@ def test_push_to_talk_is_the_fallback_when_the_mic_is_missing():
     assert isinstance(detector, PushToTalk)
 
 
-def test_wake_word_is_used_when_enabled_and_possible():
-    detector = build_wake_word(ScriptedSTT([]), VoiceConfig(wake_word_enabled=True))
+def test_wake_word_is_used_when_speech_input_exists():
+    """The builder answers "is it possible"; the voice mode answers "is it wanted"."""
+    detector = build_wake_word(ScriptedSTT([]), VoiceConfig())
     assert isinstance(detector, KeywordWakeWord)
 
 
-def test_wake_word_stays_off_unless_asked_for():
-    detector = build_wake_word(ScriptedSTT([]), VoiceConfig(wake_word_enabled=False))
+def test_an_unusable_microphone_falls_back_to_press_enter():
+    detector = build_wake_word(ScriptedSTT([], available=False), VoiceConfig())
     assert isinstance(detector, PushToTalk)
 
 
